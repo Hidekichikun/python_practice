@@ -9,15 +9,23 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import pygame
 import os
+import threading
+import queue
 from datetime import timedelta
 from mutagen.mp3 import MP3
+
+try:
+    from faster_whisper import WhisperModel
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
 
 
 class LRCGenerator:
     def __init__(self, root):
         self.root = root
         self.root.title("LRCファイルジェネレーター")
-        self.root.geometry("800x600")
+        self.root.geometry("850x700")
 
         # 初期化
         pygame.mixer.init()
@@ -30,8 +38,22 @@ class LRCGenerator:
         self.lyrics_data = []  # [(timestamp, lyric), ...]
         self.mp3_length = 0
 
+        # Whisper関連
+        self.result_queue = queue.Queue()
+        self.whisper_model = None
+        self._loaded_model_name = None
+        self._loaded_device = None
+        self.detection_thread = None
+
         # GUI作成
         self.create_widgets()
+
+        if not WHISPER_AVAILABLE:
+            messagebox.showwarning(
+                "依存関係エラー",
+                "faster-whisper がインストールされていません。\n"
+                "pip install faster-whisper を実行してください。"
+            )
 
         # タイマー
         self.update_timer()
@@ -66,23 +88,54 @@ class LRCGenerator:
         lyrics_frame = ttk.LabelFrame(main_frame, text="歌詞入力", padding="5")
         lyrics_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
-        ttk.Label(lyrics_frame, text="現在の行:").grid(row=0, column=0, sticky=tk.W)
+        # Sub-Row 0: モデル設定バー
+        config_frame = ttk.Frame(lyrics_frame)
+        config_frame.grid(row=0, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 5))
 
-        self.current_lyric_entry = ttk.Entry(lyrics_frame, width=60)
-        self.current_lyric_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
-        self.current_lyric_entry.bind('<Return>', lambda e: self.add_timestamp())
+        ttk.Label(config_frame, text="Whisperモデル:").grid(row=0, column=0, padx=(0, 2))
+        self.model_var = tk.StringVar(value="medium")
+        ttk.OptionMenu(config_frame, self.model_var, "medium", "small", "medium", "large-v3").grid(
+            row=0, column=1, padx=(0, 15))
 
-        ttk.Button(lyrics_frame, text="タイムスタンプを記録 (Enter)", command=self.add_timestamp).grid(row=0, column=2, padx=5)
+        ttk.Label(config_frame, text="デバイス:").grid(row=0, column=2, padx=(0, 2))
+        self.device_var = tk.StringVar(value="cpu")
+        ttk.OptionMenu(config_frame, self.device_var, "auto", "auto", "cpu", "cuda").grid(
+            row=0, column=3)
 
-        # タイムスタンプ付き歌詞リスト
-        ttk.Label(lyrics_frame, text="記録済み歌詞:").grid(row=1, column=0, sticky=(tk.W, tk.N), pady=(10, 0))
+        # Sub-Row 1: 歌詞テキスト入力ラベル
+        ttk.Label(lyrics_frame, text="歌詞テキスト（1行につき1フレーズ）:").grid(
+            row=1, column=0, sticky=tk.W)
 
-        self.lyrics_text = scrolledtext.ScrolledText(lyrics_frame, width=70, height=15)
-        self.lyrics_text.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        # Sub-Row 2: 歌詞一括入力テキストエリア
+        self.input_lyrics_text = scrolledtext.ScrolledText(lyrics_frame, width=70, height=10)
+        self.input_lyrics_text.grid(
+            row=2, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
 
-        # 編集ボタン
+        # Sub-Row 3: 自動検出ボタン + プログレスバー + ステータス
+        detect_frame = ttk.Frame(lyrics_frame)
+        detect_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+
+        self.detect_button = ttk.Button(
+            detect_frame, text="自動タイムスタンプ検出", command=self.start_detection)
+        self.detect_button.grid(row=0, column=0, padx=5)
+
+        self.progress_bar = ttk.Progressbar(detect_frame, mode="indeterminate", length=250)
+        self.progress_bar.grid(row=0, column=1, padx=10)
+
+        self.status_label = ttk.Label(detect_frame, text="待機中", foreground="gray")
+        self.status_label.grid(row=0, column=2, padx=5)
+
+        # Sub-Row 4: 記録済み歌詞ラベル
+        ttk.Label(lyrics_frame, text="記録済み歌詞（タイムスタンプ付き）:").grid(
+            row=4, column=0, sticky=(tk.W, tk.N), pady=(10, 0))
+
+        # Sub-Row 5: 記録済み歌詞表示
+        self.lyrics_text = scrolledtext.ScrolledText(lyrics_frame, width=70, height=8)
+        self.lyrics_text.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+
+        # Sub-Row 6: 編集ボタン
         edit_frame = ttk.Frame(lyrics_frame)
-        edit_frame.grid(row=3, column=0, columnspan=3, pady=5)
+        edit_frame.grid(row=6, column=0, columnspan=3, pady=5)
 
         ttk.Button(edit_frame, text="最後の行を削除", command=self.delete_last).grid(row=0, column=0, padx=5)
         ttk.Button(edit_frame, text="すべてクリア", command=self.clear_all).grid(row=0, column=1, padx=5)
@@ -99,9 +152,156 @@ class LRCGenerator:
         self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
         main_frame.rowconfigure(2, weight=1)
-        lyrics_frame.columnconfigure(1, weight=1)
+        lyrics_frame.columnconfigure(0, weight=1)
         lyrics_frame.rowconfigure(2, weight=1)
+        lyrics_frame.rowconfigure(5, weight=1)
         file_frame.columnconfigure(0, weight=1)
+
+    def _resolve_device(self) -> str:
+        """デバイス設定を解決する。autoの場合はCUDA優先で自動判定。"""
+        choice = self.device_var.get()
+        if choice == "auto":
+            try:
+                import ctranslate2
+                supported = ctranslate2.get_supported_compute_types("cuda")
+                if supported:
+                    return "cuda"
+            except Exception:
+                pass
+            return "cpu"
+        return choice
+
+    def start_detection(self):
+        """自動タイムスタンプ検出を開始する。"""
+        if not WHISPER_AVAILABLE:
+            messagebox.showerror("エラー", "faster-whisper が未インストールです\npip install faster-whisper を実行してください")
+            return
+        if not self.mp3_file:
+            messagebox.showwarning("警告", "MP3ファイルを選択してください")
+            return
+
+        raw_text = self.input_lyrics_text.get("1.0", tk.END).strip()
+        if not raw_text:
+            messagebox.showwarning("警告", "歌詞テキストを入力してください")
+            return
+
+        if self.detection_thread and self.detection_thread.is_alive():
+            messagebox.showwarning("警告", "現在解析中です。完了をお待ちください")
+            return
+
+        lyric_lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+
+        self.detect_button.config(state="disabled")
+        self.progress_bar.start(10)
+        self.status_label.config(text="初期化中...", foreground="blue")
+
+        self.detection_thread = threading.Thread(
+            target=self._run_whisper,
+            args=(lyric_lines,),
+            daemon=True
+        )
+        self.detection_thread.start()
+        self.root.after(100, self._poll_result_queue)
+
+    def _run_whisper(self, lyric_lines: list):
+        """バックグラウンドスレッドでWhisperを実行する。"""
+        try:
+            model_name = self.model_var.get()
+            device = self._resolve_device()
+            compute_type = "int8_float16" if device == "cuda" else "int8"
+
+            # モデルキャッシュ: 同一モデル/デバイスなら再利用
+            if (self.whisper_model is None
+                    or self._loaded_model_name != model_name
+                    or self._loaded_device != device):
+                self.result_queue.put(("status", f"モデル '{model_name}' を読み込み中（初回はDL含む）..."))
+                try:
+                    self.whisper_model = WhisperModel(
+                        model_name, device=device, compute_type=compute_type
+                    )
+                except Exception:
+                    # CUDAライブラリ未インストール等の場合はCPUにフォールバック
+                    device = "cpu"
+                    compute_type = "int8"
+                    self.result_queue.put(("status", "GPU初期化失敗 → CPUで実行します..."))
+                    self.whisper_model = WhisperModel(
+                        model_name, device=device, compute_type=compute_type
+                    )
+                self._loaded_model_name = model_name
+                self._loaded_device = device
+
+            self.result_queue.put(("status", "音声解析中（しばらくお待ちください）..."))
+
+            segments, info = self.whisper_model.transcribe(
+                self.mp3_file,
+                language="ja",
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters={"min_silence_duration_ms": 500}
+            )
+            segment_list = list(segments)
+
+            self.result_queue.put(("status", f"{len(segment_list)}セグメント検出 → 歌詞を対応付け中..."))
+            aligned = self._align_lyrics(lyric_lines, segment_list)
+            self.result_queue.put(("done", aligned))
+
+        except Exception as e:
+            import traceback
+            self.result_queue.put(("error", f"{str(e)}\n{traceback.format_exc()}"))
+
+    def _align_lyrics(self, lyric_lines: list, segments: list) -> list:
+        """Whisperセグメントとユーザー歌詞行を比率マッピングで対応付ける。"""
+        n_lines = len(lyric_lines)
+        n_segs = len(segments)
+
+        if n_segs == 0:
+            interval = self.mp3_length / max(n_lines, 1) if self.mp3_length > 0 else 0
+            return [(i * interval, line) for i, line in enumerate(lyric_lines)]
+
+        if n_lines == n_segs:
+            return [(seg.start, line) for seg, line in zip(segments, lyric_lines)]
+
+        result = []
+        for i, line in enumerate(lyric_lines):
+            if n_lines == 1:
+                seg_idx = 0
+            else:
+                seg_idx = round(i * (n_segs - 1) / (n_lines - 1))
+            seg_idx = max(0, min(seg_idx, n_segs - 1))
+            result.append((segments[seg_idx].start, line))
+
+        ratio = abs(n_lines - n_segs) / max(n_lines, n_segs)
+        if ratio > 0.5:
+            self.result_queue.put((
+                "status",
+                f"[注意] 歌詞{n_lines}行 vs セグメント{n_segs}個（差異{ratio*100:.0f}%）- 手動修正を推奨"
+            ))
+        return result
+
+    def _poll_result_queue(self):
+        """メインスレッドで定期的にキューをチェックしてUI更新する。"""
+        try:
+            while True:
+                msg_type, payload = self.result_queue.get_nowait()
+                if msg_type == "status":
+                    self.status_label.config(text=payload, foreground="blue")
+                elif msg_type == "done":
+                    self.lyrics_data = payload
+                    self.update_lyrics_display()
+                    self.progress_bar.stop()
+                    self.detect_button.config(state="normal")
+                    self.status_label.config(
+                        text=f"完了 - {len(payload)}行を検出", foreground="green")
+                    return
+                elif msg_type == "error":
+                    messagebox.showerror("解析エラー", payload[:500])
+                    self.progress_bar.stop()
+                    self.detect_button.config(state="normal")
+                    self.status_label.config(text="エラーが発生しました", foreground="red")
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_result_queue)
 
     def select_mp3(self):
         """MP3ファイルを選択"""
@@ -195,24 +395,6 @@ class LRCGenerator:
         centiseconds = int((secs % 1) * 100)
         secs_int = int(secs)
         return f"[{minutes:02d}:{secs_int:02d}.{centiseconds:02d}]"
-
-    def add_timestamp(self):
-        """現在の時間で歌詞にタイムスタンプを追加"""
-        lyric = self.current_lyric_entry.get().strip()
-
-        if not lyric:
-            messagebox.showwarning("警告", "歌詞を入力してください")
-            return
-
-        # タイムスタンプと歌詞を記録
-        self.lyrics_data.append((self.current_time, lyric))
-
-        # 表示更新
-        self.update_lyrics_display()
-
-        # 入力欄をクリア
-        self.current_lyric_entry.delete(0, tk.END)
-        self.current_lyric_entry.focus()
 
     def update_lyrics_display(self):
         """歌詞表示を更新"""
